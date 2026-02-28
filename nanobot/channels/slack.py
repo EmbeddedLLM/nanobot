@@ -3,6 +3,9 @@
 import asyncio
 import re
 from typing import Any
+import os
+import aiohttp
+from pathlib import Path
 
 from loguru import logger
 from slack_sdk.socket_mode.websockets import SocketModeClient
@@ -96,7 +99,7 @@ class SlackChannel(BaseChannel):
             for media_path in msg.media or []:
                 try:
                     await self._web_client.files_upload_v2(
-                        channel=msg.chat_id,
+                        channels=[msg.chat_id],
                         file=media_path,
                         thread_ts=thread_ts_param,
                     )
@@ -104,7 +107,33 @@ class SlackChannel(BaseChannel):
                     logger.error("Failed to upload file {}: {}", media_path, e)
         except Exception as e:
             logger.error("Error sending Slack message: {}", e)
-
+    
+    async def _download_file(self, url: str, filename: str) -> str | None:
+        """Download a private Slack file to a local temp folder."""
+        if not self.config.bot_token:
+            return None
+            
+        # Create a temp directory for downloads
+        download_dir = Path("/home/ubuntu/.nanobot/workspace/download")
+        download_dir.mkdir(parents=True, exist_ok=True)
+        
+        local_path = download_dir / filename
+        
+        headers = {"Authorization": f"Bearer {self.config.bot_token}"}
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status == 200:
+                        with open(local_path, "wb") as f:
+                            f.write(await resp.read())
+                        return str(local_path)
+                    else:
+                        logger.error(f"Failed to download file: {resp.status}")
+        except Exception as e:
+            logger.error(f"Error downloading file: {e}")
+        return None
+        
     async def _on_socket_request(
         self,
         client: SocketModeClient,
@@ -114,7 +143,7 @@ class SlackChannel(BaseChannel):
         if req.type != "events_api":
             return
 
-        # Acknowledge right away
+        # Acknowledge immediately
         await client.send_socket_mode_response(
             SocketModeResponse(envelope_id=req.envelope_id)
         )
@@ -123,63 +152,61 @@ class SlackChannel(BaseChannel):
         event = payload.get("event") or {}
         event_type = event.get("type")
 
-        # Handle app mentions or plain messages
+        # 1. Allow 'message' and 'app_mention'
         if event_type not in ("message", "app_mention"):
+            return
+
+        # 2. Allow 'file_share' subtype
+        subtype = event.get("subtype")
+        if subtype and subtype != "file_share":
             return
 
         sender_id = event.get("user")
         chat_id = event.get("channel")
-
-        # Ignore bot/system messages (any subtype = not a normal user message)
-        if event.get("subtype"):
-            return
+        
+        # Filter out bot's own messages
         if self._bot_user_id and sender_id == self._bot_user_id:
             return
 
-        # Avoid double-processing: Slack sends both `message` and `app_mention`
-        # for mentions in channels. Prefer `app_mention`.
         text = event.get("text") or ""
-        if event_type == "message" and self._bot_user_id and f"<@{self._bot_user_id}>" in text:
-            return
+        
+        # 3. Process Files (Download & Append to Text)
+        files = event.get("files")
+        if files:
+            logger.info(f"files detected: {len(files)}")
+            downloaded_paths = []
+            
+            for f in files:
+                url = f.get("url_private")
+                name = f.get("name")
+                if url and name:
+                    logger.info(f"Downloading {name}...")
+                    local_path = await self._download_file(url, name)
+                    if local_path:
+                        downloaded_paths.append(local_path)
+            
+            # Append local paths to the text so the Agent knows where to find them
+            if downloaded_paths:
+                file_msg = "\n".join([f"User uploaded file: {path}" for path in downloaded_paths])
+                text = f"{text}\n{file_msg}".strip()
 
-        # Debug: log basic event shape
-        logger.debug(
-            "Slack event: type={} subtype={} user={} channel={} channel_type={} text={}",
-            event_type,
-            event.get("subtype"),
-            sender_id,
-            chat_id,
-            event.get("channel_type"),
-            text[:80],
-        )
+        # ... (Rest of standard checks) ...
         if not sender_id or not chat_id:
             return
-
+            
         channel_type = event.get("channel_type") or ""
-
         if not self._is_allowed(sender_id, chat_id, channel_type):
             return
 
-        if channel_type != "im" and not self._should_respond_in_channel(event_type, text, chat_id):
-            return
-
+        # Strip bot mention
         text = self._strip_bot_mention(text)
 
+        # Threading logic
         thread_ts = event.get("thread_ts")
         if self.config.reply_in_thread and not thread_ts:
             thread_ts = event.get("ts")
-        # Add :eyes: reaction to the triggering message (best-effort)
-        try:
-            if self._web_client and event.get("ts"):
-                await self._web_client.reactions_add(
-                    channel=chat_id,
-                    name=self.config.react_emoji,
-                    timestamp=event.get("ts"),
-                )
-        except Exception as e:
-            logger.debug("Slack reactions_add failed: {}", e)
 
-        # Thread-scoped session key for channel/group messages
+        # Session Key
         session_key = f"slack:{chat_id}:{thread_ts}" if thread_ts and channel_type != "im" else None
 
         try:
