@@ -315,6 +315,8 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
     # Moonshot: Kimi models, needs "moonshot/" prefix.
     # LiteLLM requires MOONSHOT_API_BASE env var to find the endpoint.
     # Kimi K2.5 API enforces temperature >= 1.0.
+    # Disable thinking to prevent empty-content responses where the model
+    # puts all output into reasoning_content and returns content="".
     ProviderSpec(
         name="moonshot",
         keywords=("moonshot", "kimi"),

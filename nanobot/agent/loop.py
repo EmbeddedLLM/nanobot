@@ -181,6 +181,7 @@ class AgentLoop:
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        empty_retries = 0
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -232,6 +233,23 @@ class AgentLoop:
                     logger.error("LLM returned error: {}", (clean or "")[:200])
                     final_content = clean or "Sorry, I encountered an error calling the AI model."
                     break
+                # Some models (e.g. Kimi K2.5) return empty content with only
+                # reasoning_content populated.  Retry up to 2 times with a nudge
+                # instead of silently returning nothing.
+                if not clean and empty_retries < 2:
+                    empty_retries += 1
+                    logger.warning(
+                        "Empty response from model (retry {}/2), nudging",
+                        empty_retries,
+                    )
+                    messages = self.context.add_assistant_message(
+                        messages, clean, reasoning_content=response.reasoning_content,
+                    )
+                    messages.append({
+                        "role": "user",
+                        "content": "You returned an empty response. Please reply with text or use a tool.",
+                    })
+                    continue
                 messages = self.context.add_assistant_message(
                     messages, clean, reasoning_content=response.reasoning_content,
                 )
