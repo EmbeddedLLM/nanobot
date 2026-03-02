@@ -9,13 +9,16 @@ from typing import Any
 
 import litellm
 from litellm import acompletion
+from loguru import logger
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.providers.registry import find_by_model, find_gateway
 
 
 # Standard OpenAI chat-completion message keys plus reasoning_content for
-# thinking-enabled models (Kimi k2.5, DeepSeek-R1, etc.).
+# thinking-enabled models (Kimi K2.5, DeepSeek-R1, etc.).
+# Kimi K2.5 requires reasoning_content on assistant messages when thinking mode
+# is enabled — omitting it breaks the interleaved-thinking reasoning chain.
 _ALLOWED_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name", "reasoning_content"})
 _ALNUM = string.ascii_letters + string.digits
 
@@ -227,52 +230,108 @@ class LiteLLMProvider(LLMProvider):
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
-        
+
+        # Cap per-call timeout so a hanging gateway doesn't block the agent
+        # for the full LiteLLM default of 600s.
+        kwargs["timeout"] = 600
+
+        # Use streaming to keep the connection alive during long generations.
+        # Tokens arrive incrementally so gateways/proxies don't drop idle
+        # connections.  We buffer all chunks and return a single LLMResponse
+        # so the agent loop is unaffected.
+        kwargs["stream"] = True
+
         try:
-            response = await acompletion(**kwargs)
-            return self._parse_response(response)
+            stream = await acompletion(**kwargs)
+            return await self._consume_stream(stream)
         except Exception as e:
             # Return error as content for graceful handling
             return LLMResponse(
                 content=f"Error calling LLM: {str(e)}",
                 finish_reason="error",
             )
-    
-    def _parse_response(self, response: Any) -> LLMResponse:
-        """Parse LiteLLM response into our standard format."""
-        choice = response.choices[0]
-        message = choice.message
-        
-        tool_calls = []
-        if hasattr(message, "tool_calls") and message.tool_calls:
-            for tc in message.tool_calls:
-                # Parse arguments from JSON string if needed
-                args = tc.function.arguments
-                if isinstance(args, str):
-                    args = json_repair.loads(args)
-                
-                tool_calls.append(ToolCallRequest(
-                    id=_short_tool_id(),
-                    name=tc.function.name,
-                    arguments=args,
-                ))
-        
-        usage = {}
-        if hasattr(response, "usage") and response.usage:
-            usage = {
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens,
-                "total_tokens": response.usage.total_tokens,
-            }
-        
-        reasoning_content = getattr(message, "reasoning_content", None) or None
-        
+
+    async def _consume_stream(self, stream: Any) -> LLMResponse:
+        """Buffer a streaming response into a single LLMResponse."""
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        # tool_calls_by_index accumulates argument fragments keyed by index
+        tool_calls_by_index: dict[int, dict[str, Any]] = {}
+        finish_reason = "stop"
+        usage: dict[str, int] = {}
+
+        async for chunk in stream:
+            if not chunk.choices:
+                # Final chunk may carry only usage
+                if hasattr(chunk, "usage") and chunk.usage:
+                    usage = {
+                        "prompt_tokens": getattr(chunk.usage, "prompt_tokens", 0) or 0,
+                        "completion_tokens": getattr(chunk.usage, "completion_tokens", 0) or 0,
+                        "total_tokens": getattr(chunk.usage, "total_tokens", 0) or 0,
+                    }
+                continue
+
+            delta = chunk.choices[0].delta
+
+            # Content text
+            if hasattr(delta, "content") and delta.content:
+                content_parts.append(delta.content)
+
+            # Reasoning / thinking content
+            if hasattr(delta, "reasoning_content") and delta.reasoning_content:
+                reasoning_parts.append(delta.reasoning_content)
+
+            # Tool calls (arrive as indexed fragments)
+            if hasattr(delta, "tool_calls") and delta.tool_calls:
+                for tc_delta in delta.tool_calls:
+                    idx = tc_delta.index if hasattr(tc_delta, "index") and tc_delta.index is not None else 0
+                    if idx not in tool_calls_by_index:
+                        tool_calls_by_index[idx] = {"id": "", "name": "", "arguments": ""}
+                    entry = tool_calls_by_index[idx]
+                    if hasattr(tc_delta, "id") and tc_delta.id:
+                        entry["id"] = tc_delta.id
+                    if hasattr(tc_delta, "function") and tc_delta.function:
+                        if hasattr(tc_delta.function, "name") and tc_delta.function.name:
+                            entry["name"] = tc_delta.function.name
+                        if hasattr(tc_delta.function, "arguments") and tc_delta.function.arguments:
+                            entry["arguments"] += tc_delta.function.arguments
+
+            # Finish reason
+            if chunk.choices[0].finish_reason:
+                finish_reason = chunk.choices[0].finish_reason
+
+            # Usage (some providers send it on the last chunk with choices)
+            if hasattr(chunk, "usage") and chunk.usage:
+                usage = {
+                    "prompt_tokens": getattr(chunk.usage, "prompt_tokens", 0) or 0,
+                    "completion_tokens": getattr(chunk.usage, "completion_tokens", 0) or 0,
+                    "total_tokens": getattr(chunk.usage, "total_tokens", 0) or 0,
+                }
+
+        # Assemble tool calls
+        tool_calls: list[ToolCallRequest] = []
+        for idx in sorted(tool_calls_by_index):
+            entry = tool_calls_by_index[idx]
+            args = entry["arguments"]
+            if isinstance(args, str) and args:
+                args = json_repair.loads(args)
+            elif not args:
+                args = {}
+            tool_calls.append(ToolCallRequest(
+                id=_short_tool_id(),
+                name=entry["name"],
+                arguments=args,
+            ))
+
+        content = "".join(content_parts) or None
+        reasoning = "".join(reasoning_parts) or None
+
         return LLMResponse(
-            content=message.content,
+            content=content,
             tool_calls=tool_calls,
-            finish_reason=choice.finish_reason or "stop",
+            finish_reason=finish_reason,
             usage=usage,
-            reasoning_content=reasoning_content,
+            reasoning_content=reasoning,
         )
     
     def get_default_model(self) -> str:
