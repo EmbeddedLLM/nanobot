@@ -70,8 +70,10 @@ class CustomProvider(LLMProvider):
             if hasattr(delta, "content") and delta.content:
                 content_parts.append(delta.content)
 
-            if hasattr(delta, "reasoning_content") and delta.reasoning_content:
-                reasoning_parts.append(delta.reasoning_content)
+            # reasoning_content (Kimi, Fireworks) or reasoning (Together)
+            rc = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+            if rc:
+                reasoning_parts.append(rc)
 
             if hasattr(delta, "tool_calls") and delta.tool_calls:
                 for tc_delta in delta.tool_calls:
