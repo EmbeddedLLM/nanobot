@@ -32,10 +32,15 @@ class CustomProvider(LLMProvider):
 
     async def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
                    model: str | None = None, max_tokens: int = 4096, temperature: float = 0.7) -> LLMResponse:
+        resolved_model = model or self.default_model
+        # OpenAI's newer models (o1, o3, gpt-4.5, gpt-5+) require
+        # max_completion_tokens and reject the legacy max_tokens param.
+        use_new = any(resolved_model.startswith(p) for p in ("o1", "o3", "gpt-4.5", "gpt-5"))
+        tok_key = "max_completion_tokens" if use_new else "max_tokens"
         kwargs: dict[str, Any] = {
-            "model": model or self.default_model,
+            "model": resolved_model,
             "messages": self._sanitize_empty_content(messages),
-            "max_tokens": max(1, max_tokens),
+            tok_key: max(1, max_tokens),
             "temperature": temperature,
             "stream": True,
         }
