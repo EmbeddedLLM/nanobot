@@ -14,6 +14,7 @@ from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
 _ALNUM = string.ascii_letters + string.digits
 
+
 def _short_tool_id() -> str:
     """Generate a 9-char alphanumeric ID compatible with all providers."""
     return "".join(secrets.choice(_ALNUM) for _ in range(9))
@@ -31,19 +32,17 @@ class CustomProvider(LLMProvider):
         )
 
     async def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
-                   model: str | None = None, max_tokens: int = 4096, temperature: float = 0.7) -> LLMResponse:
-        resolved_model = model or self.default_model
-        # OpenAI's newer models (o1, o3, gpt-4.5, gpt-5+) require
-        # max_completion_tokens and reject the legacy max_tokens param.
-        use_new = any(resolved_model.startswith(p) for p in ("o1", "o3", "gpt-4.5", "gpt-5"))
-        tok_key = "max_completion_tokens" if use_new else "max_tokens"
+                   model: str | None = None, max_tokens: int = 4096, temperature: float = 0.7,
+                   reasoning_effort: str | None = None) -> LLMResponse:
         kwargs: dict[str, Any] = {
-            "model": resolved_model,
+            "model": model or self.default_model,
             "messages": self._sanitize_empty_content(messages),
-            tok_key: max(1, max_tokens),
+            "max_tokens": max(1, max_tokens),
             "temperature": temperature,
             "stream": True,
         }
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
         if tools:
             kwargs.update(tools=tools, tool_choice="auto")
         try:
