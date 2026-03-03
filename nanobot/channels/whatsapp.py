@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-from collections import OrderedDict
 from typing import Any
 
 from loguru import logger
@@ -16,19 +15,18 @@ from nanobot.config.schema import WhatsAppConfig
 class WhatsAppChannel(BaseChannel):
     """
     WhatsApp channel that connects to a Node.js bridge.
-
+    
     The bridge uses @whiskeysockets/baileys to handle the WhatsApp Web protocol.
     Communication between Python and Node.js is via WebSocket.
     """
-
+    
     name = "whatsapp"
-
+    
     def __init__(self, config: WhatsAppConfig, bus: MessageBus):
         super().__init__(config, bus)
         self.config: WhatsAppConfig = config
         self._ws = None
         self._connected = False
-        self._processed_message_ids: OrderedDict[str, None] = OrderedDict()
     
     async def start(self) -> None:
         """Start the WhatsApp channel by connecting to the bridge."""
@@ -107,34 +105,43 @@ class WhatsAppChannel(BaseChannel):
             # Incoming message from WhatsApp
             # Deprecated by whatsapp: old phone number style typically: <phone>@s.whatspp.net
             pn = data.get("pn", "")
-            # New LID sytle typically:
+            # New LID style typically: <lid>@s.whatsapp.net
             sender = data.get("sender", "")
+            # In group chats, sender is the group JID; participant is the actual user
+            participant = data.get("participant", "")
             content = data.get("content", "")
-            message_id = data.get("id", "")
+            is_group = data.get("isGroup", False)
 
-            if message_id:
-                if message_id in self._processed_message_ids:
-                    return
-                self._processed_message_ids[message_id] = None
-                while len(self._processed_message_ids) > 1000:
-                    self._processed_message_ids.popitem(last=False)
-
-            # Extract just the phone number or lid as chat_id
-            user_id = pn if pn else sender
+            # For group messages, use participant as the user identity for allow-list checks
+            if is_group and participant:
+                user_id = participant
+            else:
+                user_id = pn if pn else sender
             sender_id = user_id.split("@")[0] if "@" in user_id else user_id
-            logger.info("Sender {}", sender)
-
+            logger.info("Sender {} (participant: {}, group: {})", sender, participant, is_group)
+            
             # Handle voice transcription if it's a voice message
             if content == "[Voice Message]":
                 logger.info("Voice message received from {}, but direct download from bridge is not yet supported.", sender_id)
                 content = "[Voice Message: Transcription not available for WhatsApp yet]"
+
+            # Group policy: filter messages in group chats
+            if is_group and self.config.group_policy == "mention":
+                if not self._bot_is_mentioned(data):
+                    logger.debug("Skipping group message from {} — bot not mentioned", sender_id)
+                    return
+            elif is_group and self.config.group_policy == "keyword":
+                keyword = self.config.group_keyword.lower()
+                if keyword not in content.lower():
+                    logger.debug("Skipping group message from {} — keyword '{}' not found", sender_id, keyword)
+                    return
 
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=sender,  # Use full LID for replies
                 content=content,
                 metadata={
-                    "message_id": message_id,
+                    "message_id": data.get("id"),
                     "timestamp": data.get("timestamp"),
                     "is_group": data.get("isGroup", False)
                 }
@@ -156,3 +163,18 @@ class WhatsAppChannel(BaseChannel):
         
         elif msg_type == "error":
             logger.error("WhatsApp bridge error: {}", data.get('error'))
+
+    @staticmethod
+    def _bot_is_mentioned(data: dict) -> bool:
+        """Check if the bot was @mentioned in a group message."""
+        bot_jid = data.get("botJid", "")
+        mentioned = data.get("mentionedJid", [])
+        if not bot_jid or not mentioned:
+            return False
+        # Compare by phone-number prefix (before ':' or '@') since JID formats
+        # can vary, e.g. "1234:56@s.whatsapp.net" vs "123456@s.whatsapp.net"
+        bot_num = bot_jid.split("@")[0].split(":")[0]
+        for jid in mentioned:
+            if jid.split("@")[0].split(":")[0] == bot_num:
+                return True
+        return False

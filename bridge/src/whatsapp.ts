@@ -21,9 +21,12 @@ export interface InboundMessage {
   id: string;
   sender: string;
   pn: string;
+  participant: string;
   content: string;
   timestamp: number;
   isGroup: boolean;
+  mentionedJid: string[];
+  botJid: string;
 }
 
 export interface WhatsAppClientOptions {
@@ -121,13 +124,23 @@ export class WhatsAppClient {
 
         const isGroup = msg.key.remoteJid?.endsWith('@g.us') || false;
 
+        // Extract mentioned JIDs from context info (for @mentions in groups)
+        const contextInfo = msg.message?.extendedTextMessage?.contextInfo
+          || msg.message?.imageMessage?.contextInfo
+          || msg.message?.videoMessage?.contextInfo
+          || msg.message?.documentMessage?.contextInfo;
+        const mentionedJid: string[] = contextInfo?.mentionedJid || [];
+
         this.options.onMessage({
           id: msg.key.id || '',
           sender: msg.key.remoteJid || '',
           pn: msg.key.remoteJidAlt || '',
+          participant: msg.key.participant || '',
           content,
           timestamp: msg.messageTimestamp as number,
           isGroup,
+          mentionedJid,
+          botJid: this.sock?.user?.id || '',
         });
       }
     });

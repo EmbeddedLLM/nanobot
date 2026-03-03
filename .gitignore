@@ -21,3 +21,6 @@ poetry.lock
 botpy.log
 tests/
 uv.lock
+node_modules/
+bridge/dist/
+bridge/package-lock.json
